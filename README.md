@@ -1,139 +1,140 @@
-# AgentFlow: Multi-Step Agent System for Tool-Based Reasoning and Execution
+# AgentFlow: Multi-Step Agent for Tool-Based Reasoning
 
-A multi-step agent framework that plans tool use, executes actions, verifies outcomes, and improves decision quality through Flow-GRPO reinforcement learning.
+A multi-step agent that decomposes a question, calls tools, verifies intermediate results, and produces a final answer. The Planner is fine-tuned with LoRA + GRPO on Qwen3.5-0.8B. Built on the AgentFlow framework (arXiv:2510.05592).
 
----
+## Architecture
 
-## 1. Overview
-
-This project implements an autonomous agent system that solves complex tasks through iterative reasoning and tool use.
-
-Instead of generating answers in a single step, the system follows a loop:
+The inference loop has four roles:
 
 ```
-plan → act → verify → refine
+question → Planner → Executor → Memory → Verifier ──┐
+              ▲                                      │
+              └────── continue ──────────────────────┘
+                                                     │ STOP
+                                                     ▼
+                                                  Generator → answer
 ```
 
-enabling more reliable and interpretable behavior.
+Only the Planner's `generate_next_step` is trainable. Query analysis and final-answer generation live in the same `Planner` class but call a frozen `llm_engine_fixed` (gpt-4o-mini). Executor and Verifier are gpt-4o-mini as well.
 
-It supports both:
+Tools enabled during training:
 
-- open-ended reasoning tasks (e.g., multi-hop QA)
-- structured data tasks (e.g., Text-to-SQL)
+- `Base_Generator_Tool` — direct LLM fallback
+- `Python_Coder_Tool`
+- `Google_Search_Tool`
+- `Wikipedia_Search_Tool`
 
----
+An SQL execution tool (`AgentFlow/agentflow/tools/execute_sql_tool.py`) is added at Spider eval time only — the trained Planner has never seen it.
 
-## 2. Architecture
+Memory is a per-question Python dict keyed by step number, storing `(tool_name, sub_goal, command, result)` per step. It is stringified into Planner/Verifier prompts via `repr()` and discarded when the question is done. No vector store, no compression.
 
-The system is built around a **Planner–Executor–Verifier** loop:
+## Training
 
-- **Planner** — decomposes the task and selects tools
-- **Executor** — executes actions using tools (search, SQL, etc.)
-- **Verifier** — evaluates intermediate results and decides whether to stop, retry, or continue
+`train/modal_train_agent.py` runs the production training on Modal L40S.
+
+| | |
+|---|---|
+| Base model | `Qwen/Qwen3.5-0.8B` |
+| Method | LoRA + GRPO (single-turn) |
+| LoRA | r=8, α=32, targets q/k/v/o + gate/up/down |
+| Optimizer | lr=1e-5, bf16 |
+| Batch | per-device 4, grad accum 4 (effective 16) |
+| Max steps | 3000 |
+| Generations per prompt | 8 |
+| Data | `data/train/combined_train.parquet` |
+| Saved to | `results/final_qwen35_lora` |
+
+The reward function (`reward_logic_function` in the same file):
 
 ```
-       ┌───────────┐       ┌───────────┐       ┌───────────┐
-user → │  Planner  │ ────▶ │  Executor │ ────▶ │  Verifier │
-       └───────────┘       └───────────┘       └─────┬─────┘
-             ▲                                       │
-             └─────────── replan on failure ─────────┘
++0.2 each for <think>, </think>, <answer>, </answer>      (format, max 0.8)
++2.0 if extracted <answer> content == groundtruth         (EM, lowercased)
++0.5 if groundtruth string appears anywhere in completion (substring)
 ```
 
-This creates an iterative decision loop rather than a one-shot response system.
+Range 0 – 2.8. GRPO turns this into group-relative advantages over the 8 generations and applies a clipped PPO-style update with KL against the reference model.
 
----
+Training is single-turn: the model produces flat `<think>...</think><answer>...</answer>` completions. The 4-role loop is only assembled at inference time. This differs from the in-the-flow training in the original paper.
 
-## 3. Key Capabilities
+The repo also contains a verl-based multi-turn pipeline (`train/train_agent.py` → `agentflow.verl` → `train/rollout.py`) that drives the full loop during training and uses gpt-4o as an LLM-judge for the reward (`train/utils.py::compute_score`). This pipeline is not what produced the released checkpoint — `serve_lora_local.py` loads `results/final_qwen35_lora`, which is the save path of the Modal/TRL script.
 
-- **Multi-step reasoning** — handles complex tasks through iterative planning instead of one-shot generation
-- **Tool-based execution** — integrates external tools such as search and SQL for grounded reasoning
-- **Hybrid verification** — combines LLM-based semantic judgment with rule-based execution checks
-- **Cross-task generalization** — extends to new tasks (e.g., Text-to-SQL) without task-specific retraining
-- **RL-based decision improvement** — improves planner behavior through Flow-GRPO + LoRA training
+## Serving
 
----
+```bash
+python serve_lora_local.py
+```
 
-## 4. Design Decisions
+Loads the trained LoRA adapter and exposes the Planner as an OpenAI-compatible endpoint. Default adapter: `Skypioneer/qwen35-0.8b-agentflow-lora` on HF Hub. Override with `MERGED_MODEL` or `LORA_DIR` env vars.
 
-**Planner–Executor–Verifier instead of one-shot generation.**
-Separating decision-making, execution, and validation improves reliability on multi-step tasks and makes failures localizable.
+Inference defaults (`AgentFlow/agentflow/solver.py`): `max_steps=10`, `max_time=300s`, frozen modules via OpenAI gpt-4o-mini.
 
-**Hybrid verification strategy.**
-LLM-based judgment is used for open-ended outputs (QA benchmarks); execution-based checks are used for structured outputs (SQL execution match). Code-level error handling catches hard tool failures before they reach the model.
+For SLURM/H200 deployment see `run_lora_h200.sbatch` and `cluster_check.sh`.
 
-**Role-specific model selection.**
-The Planner is the trainable component (Qwen3.5-0.8B with LoRA). The Verifier and Executor use a fixed external model (gpt-4o-mini). This lets us optimize planning behavior in isolation without retraining the rest of the stack.
+## Results
 
-**LoRA for efficient adaptation.**
-LoRA (rank 8, <1% trainable parameters) enables low-cost fine-tuning of planner behavior without full model retraining — critical for iterating on RL reward design.
+Five multi-hop benchmarks. Baseline is the same Qwen3.5-0.8B Planner without LoRA, plugged into the identical inference loop with identical frozen modules and tools.
 
-**Flow-GRPO for planner optimization.**
-GRPO's group-relative advantage estimation is well-suited to trajectory-level rewards in tool-using agents, and removes the need for a separate value network.
-
----
-
-## 5. Results
-
-Evaluated across 5 multi-hop reasoning benchmarks on a single H200 GPU:
-
-| Benchmark | No-Training | LoRA-Training | Delta |
+| Benchmark | No-Training | LoRA-Trained | Δ |
 |---|---:|---:|---:|
-| HotpotQA | 8.0 | 30.0 | **+22.0** |
+| HotpotQA | 8.0 | 30.0 | +22.0 |
 | 2Wiki | 15.0 | 28.0 | +13.0 |
 | Bamboogle | 10.4 | 18.0 | +7.6 |
 | GAIA | 0.0 | 6.0 | +6.0 |
 | MuSiQue | 3.0 | 6.0 | +3.0 |
 
-LoRA training improves performance across **all five tasks**, with the strongest gain on multi-hop QA (HotpotQA: 8% → 30%).
+Eval scoring uses gpt-4o as a semantic-equivalence judge (`test/calculate_score_unified.py::ResultScorer`), not exact match.
 
-Additionally, the system demonstrates **cross-task transfer** to Text-to-SQL (Spider benchmark), where Qwen3.5-0.8B reaches 50% execution accuracy — outperforming a larger Qwen2.5-7B-Instruct zero-shot baseline (35%) without task-specific retraining.
+### Cross-task transfer: Text-to-SQL
 
----
+The trained Planner never sees an SQL tool. At test time `Execute_SQL_Tool` is added to the Executor's toolbox and the system is evaluated on Spider with execution accuracy:
 
-## 6. Training
+| Model | Spider EX |
+|---|---:|
+| Qwen2.5-7B-Instruct, zero-shot | 35 |
+| Qwen3.5-0.8B + LoRA (this work) | 50 |
 
-- **Base model**: Qwen3.5-0.8B
-- **Method**: Flow-GRPO + LoRA (rank 8, <1% trainable parameters)
-- **Reward**: hybrid (format + correctness) evaluated at trajectory level
-- **Group size**: 8 trajectories per prompt, compared via group-relative advantage
-- **Target**: improving multi-step decision quality, not just output text
+Zero-shot tool acquisition — no SQL-specific fine-tuning.
 
-Training ran on Modal using TRL's `GRPOTrainer` with PEFT; the merged adapter is served for evaluation on a single H200 GPU via a local FastAPI endpoint.
+## Limitations
 
----
+- Absolute scores are below leaderboard SOTA. The numbers above measure the lift over the same untrained planner, not a comparison with SOTA systems.
+- Training reward is rule-based (format + EM + substring); eval uses LLM-judge. The mismatch can underweight semantically-correct-but-paraphrased answers during training.
+- Training is single-turn; the multi-turn loop is only at inference. The Planner does not realize the in-the-flow credit assignment described in the original paper.
+- `max_steps=10` at inference. GAIA and MuSiQue often need longer chains.
 
-## 7. Quick Start
+## Repository layout
 
-```bash
-# install dependencies
-pip install -r requirements_lora_serve.txt
+```
+AgentFlow/agentflow/
+  solver.py             main inference loop
+  models/               planner, executor, verifier, memory
+  tools/                tool implementations (incl. execute_sql_tool.py)
 
-# quick inference sanity check
-python quick_start.py
+train/
+  modal_train_agent.py  production: TRL GRPOTrainer on Modal L40S
+  train_agent.py        alt: verl entrypoint
+  rollout.py            alt: multi-turn rollout with LLM-judge reward
+  utils.py              compute_score (gpt-4o judge, used by alt pipeline)
+  config.yaml           verl config
 
-# serve the LoRA-trained planner on a GPU node
-python serve_lora_local.py
-
-# run a benchmark (example: Bamboogle)
-cd test/bamboogle && bash run.sh
+serve_lora_local.py     FastAPI serving on H200
+run_lora_h200.sbatch    SLURM deployment
+test/                   one directory per benchmark
 ```
 
-For cluster deployment (SLURM + H200), see `run_lora_h200.sbatch` and `cluster_check.sh`.
+## Quick start
 
----
+```bash
+pip install -r requirements_lora_serve.txt
+python quick_start.py            # smoke test
+python serve_lora_local.py       # serve adapter
+cd test/bamboogle && bash run.sh # run a benchmark
+```
 
-## 8. Extending
+For training: `python train/modal_train_agent.py` (requires a Modal account).
 
-The framework can be extended by defining a new tool interface and updating the planner's action space. Each role (Planner / Executor / Verifier) can be swapped or re-optimized independently because the interfaces between them are structured.
+## Credits
 
-This makes the architecture applicable beyond QA and SQL tasks to domains such as robotics or workflow automation, where an agent must plan actions, interact with external environments, and verify outcomes in a feedback loop.
+Built on AgentFlow: *In-the-Flow Agentic System Optimization* (arXiv:2510.05592).
 
----
-
-## 9. Credits
-
-This project builds on the AgentFlow framework introduced in:
-
-> AgentFlow: In-the-Flow Agentic System Optimization (ICLR 2026). [arXiv:2510.05592](https://arxiv.org/abs/2510.05592)
-
-Contributions in this repository include: the LoRA + Flow-GRPO training pipeline on Qwen3.5-0.8B (TRL-based), the H200 cluster serving stack (FastAPI + SLURM), and the Text-to-SQL capability extension.
+Additions in this repo: single-turn LoRA + GRPO training on Qwen3.5-0.8B via TRL + Modal, FastAPI/SLURM serving on H200, and a zero-shot Text-to-SQL transfer evaluation.
